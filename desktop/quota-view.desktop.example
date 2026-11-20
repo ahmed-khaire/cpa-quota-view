@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AI Quota
+Comment=Tray view of CLIProxyAPI account quotas
+Exec=/usr/bin/python3 __INSTALL_DIR__/quota_view.py --panel
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;
