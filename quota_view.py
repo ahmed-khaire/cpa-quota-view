@@ -12,7 +12,7 @@ Configuration (~/.config/quota-view.json or environment variables):
   config_path / CPA_CONFIG_PATH        Optional local config.yaml / config.toml fallback
   refresh_sec / CPA_REFRESH_SEC        Auto-refresh interval in seconds (default 300)
   theme                                "system" | "light" | "dark"
-  notifications                        true | false (default true)
+  notifications                        true | false (default false)
   notify_thresholds                    List of % thresholds (default [80, 100])
   tray_backend                         "auto" | "statusicon" | "appindicator"
 """
@@ -1201,7 +1201,7 @@ def run_gui(start_panel=False, pin=False):
     class Tray:
         def __init__(self):
             self.theme = Theme()
-            self.notifications_enabled = bool(load_settings().get("notifications", True))
+            self.notifications_enabled = bool(load_settings().get("notifications", False))
             self.notify_state = load_notify_state()
             self.accounts, self.updated = [], None
             self.status_icon = None

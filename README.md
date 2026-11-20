@@ -57,7 +57,7 @@ CLIProxyAPI /v0/management
   - X11 `Gtk.StatusIcon` with automatic Wayland `AyatanaAppIndicator3` fallback.
   - Instant startup from disk cache (`~/.cache/quota-view/snapshot.json`).
   - Inline active cooldown & account error warnings.
-  - Debounced desktop notifications via `notify-send` on threshold crossings (`80%`, `100%`), account errors, and quota resets (toggleable from the tray menu).
+  - Optional debounced desktop notifications via `notify-send` (off by default; toggleable from the tray right-click menu) on threshold crossings (`80%`, `100%`), account errors, and quota resets.
 - **Headless CLI & status-bar modes** (zero GTK required):
   - `--print`, `--json`, `--short`, `--waybar`, `--watch [SECS]`, `--provider`, `--cached` / `--max-age`, and `--fail-above <PCT>` (exit code `2` for cron/CI alerts).
 
@@ -71,7 +71,7 @@ Create `~/.config/quota-view.json` (no secrets stored on disk when using a secre
   "base_url": "https://ai-ts.example.com",
   "mgmt_key_cmd": ["op", "read", "op://Work/swarm-cpa/MANAGEMENT_KEY"],
   "refresh_sec": 300,
-  "notifications": true,
+  "notifications": false,
   "notify_thresholds": [80, 100],
   "tray_backend": "auto"
 }
