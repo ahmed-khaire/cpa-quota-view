@@ -1,12 +1,15 @@
 import base64
 from datetime import datetime, timezone
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import quota_view as qv
 
 
-class QuotaViewParserTests(unittest.TestCase):
+class QuotaViewTests(unittest.TestCase):
     def test_claude_rows_and_scoped_limits(self):
         payload = {
             "five_hour": {"utilization": 22.5, "resets_at": "2026-11-21T05:00:00Z"},
@@ -62,7 +65,7 @@ class QuotaViewParserTests(unittest.TestCase):
         self.assertEqual(rows[0][1], 15.0)
         self.assertEqual(rows[1][1], 40.0)
 
-    def test_antigravity_grouping_and_exhausted_detection(self):
+    def test_antigravity_grouping_details_and_exhausted_detection(self):
         payload = {
             "models": {
                 "claude-opus-5-5-high": {
@@ -87,11 +90,12 @@ class QuotaViewParserTests(unittest.TestCase):
                 },
             }
         }
-        rows = qv.rows_for("antigravity", payload)
+        rows, details = qv.parse_antigravity_families(payload)
         self.assertEqual([r[0] for r in rows], ["Claude / GPT", "Gemini Pro", "Gemini Flash"])
         self.assertAlmostEqual(rows[0][1], 100.0)
         self.assertAlmostEqual(rows[1][1], 20.0)
         self.assertAlmostEqual(rows[2][1], 0.0)
+        self.assertEqual(len(details["Claude / GPT"]), 2)
 
     def test_gemini_cli_buckets(self):
         payload = {
@@ -113,21 +117,132 @@ class QuotaViewParserTests(unittest.TestCase):
         rel_past, _ = qv.when("2026-11-20T23:00:00Z", now=now)
         self.assertEqual(rel_past, "now")
 
-    def test_json_snapshot_sanitization(self):
-        snap = qv.build_json_snapshot([
+    def test_cooldown_parsing_and_formatting(self):
+        cds = qv.parse_cooldowns({
+            "cooldowns": [
+                {"model": "gemini-3-flash", "until": "2026-11-21T03:00:00Z", "reason": "429"},
+                "claude-opus",
+            ]
+        })
+        self.assertEqual(len(cds), 2)
+        self.assertEqual(cds[0]["model"], "gemini-3-flash")
+        self.assertEqual(cds[1]["model"], "claude-opus")
+
+    def test_notifications_threshold_reset_and_error(self):
+        prev = {
+            "windows": {
+                "claude:a@example.com:7 days": 70.0,
+                "codex:b@example.com:7 days": 100.0,
+            },
+            "errors": {},
+        }
+        accounts = [
             {
                 "provider": "claude",
-                "label": "user@example.com",
+                "label": "a@example.com",
+                "disabled": False,
+                "error": "",
+                "rows": [("7 days", 85.0, None, "")],
+            },
+            {
+                "provider": "codex",
+                "label": "b@example.com",
+                "disabled": False,
+                "error": "",
+                "rows": [("7 days", 0.0, None, "")],
+            },
+            {
+                "provider": "xai",
+                "label": "c@example.com",
+                "disabled": False,
+                "error": "HTTP 401",
+                "rows": [],
+            },
+        ]
+        events, state = qv.compute_notifications(prev, accounts, thresholds=[80, 100])
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0][0], "normal")
+        self.assertIn("85%", events[0][1])
+        self.assertEqual(events[1][0], "low")
+        self.assertIn("reset", events[1][1])
+        self.assertIn("error", events[2][1])
+        self.assertEqual(state["windows"]["claude:a@example.com:7 days"], 85.0)
+
+    def test_short_waybar_filter_and_cache_roundtrip(self):
+        accounts = [
+            {
+                "provider": "claude",
+                "label": "alice@example.com",
                 "status": "active",
+                "status_message": "",
                 "plan": "",
                 "disabled": False,
                 "error": "",
-                "rows": [("7 days", 42.34, "2026-11-24T00:00:00Z", "")],
+                "cooldowns": [],
+                "recent_ok": 12,
+                "recent_fail": 1,
+                "rows": [("7 days", 88.4, "2026-11-24T00:00:00Z", "")],
+                "row_details": {},
+            },
+            {
+                "provider": "codex",
+                "label": "bob@example.com",
+                "status": "active",
+                "status_message": "",
+                "plan": "pro",
+                "disabled": False,
+                "error": "",
+                "cooldowns": [],
+                "recent_ok": 4,
+                "recent_fail": 0,
+                "rows": [("7 days", 5.0, "2026-11-25T00:00:00Z", "")],
+                "row_details": {},
+            },
+        ]
+        self.assertEqual(qv.format_short(accounts), "CL:88% CX:5%")
+        wb = qv.format_waybar(accounts)
+        self.assertEqual(wb["class"], "hot")
+        self.assertEqual(wb["text"], "CL:88% CX:5%")
+
+        filtered = qv.filter_accounts(accounts, ["codex"])
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["provider"], "codex")
+
+        snap = qv.build_json_snapshot(accounts, server_version="v8.0.79")
+        self.assertEqual(snap["server_version"], "v8.0.79")
+        self.assertEqual(snap["summary"]["recent_requests"], 16)
+        self.assertEqual(snap["summary"]["recent_errors"], 1)
+
+        restored = qv.accounts_from_snapshot(snap)
+        self.assertEqual(len(restored), 2)
+        self.assertAlmostEqual(restored[0]["rows"][0][1], 88.4)
+
+    def test_fail_above_exit_code(self):
+        snap = qv.build_json_snapshot([
+            {
+                "provider": "claude",
+                "label": "alice@example.com",
+                "status": "active",
+                "status_message": "",
+                "plan": "",
+                "disabled": False,
+                "error": "",
+                "cooldowns": [],
+                "recent_ok": 0,
+                "recent_fail": 0,
+                "rows": [("7 days", 92.0, None, "")],
+                "row_details": {},
             }
         ])
-        self.assertEqual(snap["summary"]["accounts"], 1)
-        self.assertEqual(snap["summary"]["highest_used_percent"], 42.3)
-        self.assertEqual(snap["accounts"][0]["windows"][0]["remaining_percent"], 57.7)
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = os.path.join(td, "snapshot.json")
+            with open(cache_path, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh)
+            with mock.patch.object(qv, "SNAPSHOT_CACHE", cache_path), mock.patch.object(
+                qv, "get_base_url", return_value=snap["base_url"]
+            ):
+                self.assertEqual(qv.main(["--cached", "--fail-above", "90"]), 2)
+                self.assertEqual(qv.main(["--cached", "--fail-above", "95"]), 0)
 
 
 if __name__ == "__main__":

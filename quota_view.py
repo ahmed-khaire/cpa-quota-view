@@ -12,6 +12,9 @@ Configuration (~/.config/quota-view.json or environment variables):
   config_path / CPA_CONFIG_PATH        Optional local config.yaml / config.toml fallback
   refresh_sec / CPA_REFRESH_SEC        Auto-refresh interval in seconds (default 300)
   theme                                "system" | "light" | "dark"
+  notifications                        true | false (default true)
+  notify_thresholds                    List of % thresholds (default [80, 100])
+  tray_backend                         "auto" | "statusicon" | "appindicator"
 """
 import argparse
 import base64
@@ -21,6 +24,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -28,13 +33,18 @@ import time
 import urllib.error
 import urllib.request
 
-SETTINGS = os.path.join(
-    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-    "quota-view.json",
-)
+CONFIG_DIR = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "quota-view")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or CACHE_DIR
+SETTINGS = os.path.join(CONFIG_DIR, "quota-view.json")
+SNAPSHOT_CACHE = os.path.join(CACHE_DIR, "snapshot.json")
+NOTIFY_STATE = os.path.join(CACHE_DIR, "notify-state.json")
+CONTROL_SOCK = os.path.join(RUNTIME_DIR, "quota-view.sock")
+
 DEFAULT_BASE = "http://127.0.0.1:8317"
 DEFAULT_REFRESH_SEC = 300  # providers rate-limit usage endpoints; 5 min is plenty
-USER_AGENT = "cpa-quota-view/2.0"
+DEFAULT_THRESHOLDS = [80, 100]
+USER_AGENT = "cpa-quota-view/2.1"
 
 HEADERS = {
     "claude": {
@@ -106,8 +116,29 @@ NAMES = {
     "proxy": "CLIProxyAPI",
 }
 
+SHORT_NAMES = {
+    "claude": "CL",
+    "codex": "CX",
+    "antigravity": "AG",
+    "gemini-cli": "GM",
+    "xai": "XA",
+    "kimi": "KM",
+    "vertex": "VX",
+    "proxy": "CPA",
+}
+
 _key_lock = threading.Lock()
 _cached_mgmt_key = None
+
+
+def _atomic_write_json(path, data, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
 
 
 def load_settings():
@@ -120,12 +151,7 @@ def load_settings():
 
 
 def save_settings(d):
-    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-    tmp = SETTINGS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, SETTINGS)
+    _atomic_write_json(SETTINGS, d, mode=0o600)
 
 
 def get_base_url():
@@ -140,6 +166,20 @@ def get_refresh_sec():
         return max(30, int(raw))
     except (TypeError, ValueError):
         return DEFAULT_REFRESH_SEC
+
+
+def get_notify_thresholds():
+    cfg = load_settings()
+    vals = cfg.get("notify_thresholds", DEFAULT_THRESHOLDS)
+    if not isinstance(vals, list):
+        return list(DEFAULT_THRESHOLDS)
+    out = []
+    for v in vals:
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            pass
+    return sorted(set(out)) or list(DEFAULT_THRESHOLDS)
 
 
 def _read_key_from_config(path):
@@ -193,7 +233,7 @@ def mgmt_key(force=False):
         )
 
 
-def mgmt(path, data=None, key=None):
+def _mgmt_request(path, data=None, key=None):
     base = get_base_url()
     token = key or mgmt_key()
     body = json.dumps(data).encode("utf-8") if data is not None else None
@@ -205,14 +245,19 @@ def mgmt(path, data=None, key=None):
     try:
         req = urllib.request.Request(base + "/v0/management" + path, data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
+            return json.load(resp), dict(resp.headers.items())
     except urllib.error.HTTPError as e:
         if e.code in (401, 403) and key is None:
             headers["Authorization"] = "Bearer " + mgmt_key(force=True)
             req = urllib.request.Request(base + "/v0/management" + path, data=body, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.load(resp)
+                return json.load(resp), dict(resp.headers.items())
         raise
+
+
+def mgmt(path, data=None, key=None):
+    payload, _ = _mgmt_request(path, data=data, key=key)
+    return payload
 
 
 def api_call(key, auth_index, url, header, method="GET", payload=None):
@@ -294,6 +339,50 @@ def _parse_iso_ts(ts):
         return None
 
 
+def parse_antigravity_families(body):
+    """Return (rows, details_by_family) for Antigravity fetchAvailableModels payloads."""
+    models = (body or {}).get("models") or {}
+    grouped = {}
+    details = {}
+    order = ("Claude / GPT", "Gemini Pro", "Gemini Flash")
+    for mid, entry in sorted(models.items()):
+        if not isinstance(entry, dict):
+            continue
+        dn = entry.get("displayName") or entry.get("display_name")
+        qi = entry.get("quotaInfo") or entry.get("quota_info")
+        if not dn or not isinstance(qi, dict):
+            continue
+        fam = _antigravity_family(mid, dn)
+        if not fam:
+            continue
+        rem = qi.get("remainingFraction")
+        if rem is None:
+            rem = qi.get("remaining_fraction")
+        reset = qi.get("resetTime") or qi.get("reset_time")
+        # Antigravity omits remainingFraction when a bucket is exhausted and only sets resetTime.
+        if rem is None and reset:
+            used = 100.0
+        elif rem is not None:
+            used = max(0.0, min(100.0, (1.0 - float(rem)) * 100.0))
+        else:
+            continue
+        details.setdefault(fam, []).append({
+            "id": mid,
+            "name": dn,
+            "used_percent": round(used, 1),
+            "reset_at": reset,
+        })
+        cur = grouped.get(fam)
+        if cur is None or used > cur[0]:
+            grouped[fam] = [used, reset]
+        elif used == cur[0] and reset:
+            t_old, t_new = _parse_iso_ts(cur[1]), _parse_iso_ts(reset)
+            if t_new and (not t_old or t_new < t_old):
+                cur[1] = reset
+    rows = [(fam, grouped[fam][0], grouped[fam][1], "") for fam in order if fam in grouped]
+    return rows, details
+
+
 def rows_for(provider, body):
     """Normalise a provider payload into [(window label, used_percent or None, reset_ts, note)]."""
     rows = []
@@ -343,43 +432,7 @@ def rows_for(provider, body):
             rows.append(("Credits", None, None, f"balance {cr.get('balance')}"))
 
     elif provider == "antigravity":
-        models = body.get("models") or {}
-        grouped = {}
-        order = ("Claude / GPT", "Gemini Pro", "Gemini Flash")
-        for mid, entry in models.items():
-            if not isinstance(entry, dict):
-                continue
-            dn = entry.get("displayName") or entry.get("display_name")
-            qi = entry.get("quotaInfo") or entry.get("quota_info")
-            if not dn or not isinstance(qi, dict):
-                continue
-            fam = _antigravity_family(mid, dn)
-            if not fam:
-                continue
-            rem = qi.get("remainingFraction")
-            if rem is None:
-                rem = qi.get("remaining_fraction")
-            reset = qi.get("resetTime") or qi.get("reset_time")
-            # Antigravity omits remainingFraction when a bucket is exhausted and only sets resetTime.
-            if rem is None and reset:
-                used = 100.0
-            elif rem is not None:
-                used = max(0.0, min(100.0, (1.0 - float(rem)) * 100.0))
-            else:
-                continue
-            cur = grouped.get(fam)
-            if cur is None or used > cur[0]:
-                grouped[fam] = [used, reset, 1]
-            else:
-                cur[2] += 1
-                if used == cur[0] and reset:
-                    t_old, t_new = _parse_iso_ts(cur[1]), _parse_iso_ts(reset)
-                    if t_new and (not t_old or t_new < t_old):
-                        cur[1] = reset
-        for fam in order:
-            if fam in grouped:
-                used, reset, _ = grouped[fam]
-                rows.append((fam, used, reset, ""))
+        rows, _ = parse_antigravity_families(body)
 
     elif provider == "gemini-cli":
         buckets = body.get("buckets") or []
@@ -443,10 +496,29 @@ def passive_claude_rows(auth_entry):
     return rows
 
 
-def recent_activity_note(auth_entry):
+def parse_cooldowns(auth_entry):
+    """Extract normalized active cooldowns from /v0/management/auth-files entries."""
+    out = []
+    for c in auth_entry.get("cooldowns") or []:
+        if isinstance(c, str) and c.strip():
+            out.append({"model": c.strip(), "until": None, "reason": ""})
+        elif isinstance(c, dict):
+            model = c.get("model") or c.get("model_id") or c.get("scope") or "account"
+            until = c.get("until") or c.get("expires_at") or c.get("reset_at") or c.get("retry_after")
+            reason = c.get("reason") or c.get("message") or ""
+            out.append({"model": str(model), "until": until, "reason": str(reason)})
+    return out
+
+
+def recent_request_totals(auth_entry):
     buckets = auth_entry.get("recent_requests") or []
     ok = sum(int(b.get("success") or 0) for b in buckets if isinstance(b, dict))
     fail = sum(int(b.get("failed") or 0) for b in buckets if isinstance(b, dict))
+    return ok, fail
+
+
+def recent_activity_note(auth_entry):
+    ok, fail = recent_request_totals(auth_entry)
     if ok or fail:
         return f"{ok} ok, {fail} err" if fail else f"{ok} reqs recently"
     return "no quota window"
@@ -461,12 +533,21 @@ def _fetch_one(key, f):
         label = f.get("project_id") or re.sub(r"^vertex-|\.json$", "", name)
 
     status = "disabled" if f.get("disabled") else ("unavailable" if f.get("unavailable") else (f.get("status") or "active"))
+    status_msg = str(f.get("status_message") or "").strip()
+    cooldowns = parse_cooldowns(f)
+    req_ok, req_fail = recent_request_totals(f)
+
     acct = {
         "provider": provider,
         "label": label,
         "plan": "",
         "status": status,
+        "status_message": status_msg,
+        "cooldowns": cooldowns,
+        "recent_ok": req_ok,
+        "recent_fail": req_fail,
         "rows": [],
+        "row_details": {},
         "error": "",
         "disabled": bool(f.get("disabled")),
     }
@@ -475,13 +556,16 @@ def _fetch_one(key, f):
         acct["rows"] = [("Status", None, None, "disabled")]
         return acct
 
+    if status not in ("active", "ok", "") and status_msg:
+        acct["error"] = f"{status}: {status_msg}"[:90]
+
     auth_index = f.get("auth_index") or f.get("authIndex")
     if provider == "vertex":
         acct["rows"] = [("Pay as you go", None, None, recent_activity_note(f))]
         return acct
 
     if not auth_index:
-        acct["rows"] = [("Status", None, None, status)]
+        acct["rows"] = [("Status", None, None, status_msg or status)]
         return acct
 
     if provider == "antigravity":
@@ -490,9 +574,10 @@ def _fetch_one(key, f):
         for url in ANTIGRAVITY_URLS:
             try:
                 body = api_call(key, auth_index, url, HEADERS["antigravity"], method="POST", payload=payload)
-                rows = rows_for("antigravity", body)
+                rows, details = parse_antigravity_families(body)
                 if rows:
                     acct["rows"] = rows
+                    acct["row_details"] = details
                     return acct
             except Exception as e:
                 last_err = e
@@ -510,7 +595,7 @@ def _fetch_one(key, f):
         return acct
 
     if provider not in GET_URLS:
-        acct["rows"] = [("Status", None, None, f.get("status_message") or status)]
+        acct["rows"] = [("Status", None, None, status_msg or status)]
         return acct
 
     hdr = dict(HEADERS[provider])
@@ -547,25 +632,100 @@ def _fetch_one(key, f):
     return acct
 
 
-def fetch_all():
+def fetch_snapshot():
+    """Fetch live accounts and metadata from CLIProxyAPI, saving to disk cache."""
     key = mgmt_key()
-    files = mgmt("/auth-files", key=key).get("files", [])
+    payload, resp_headers = _mgmt_request("/auth-files", key=key)
+    files = payload.get("files", [])
+    server_version = ""
+    for hk, hv in resp_headers.items():
+        if hk.lower() == "x-cpa-version":
+            server_version = hv.strip()
+            break
     if not files:
-        return []
-    with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
-        return list(pool.map(lambda f: _fetch_one(key, f), files))
+        accounts = []
+    else:
+        with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
+            accounts = list(pool.map(lambda f: _fetch_one(key, f), files))
+    snap = build_json_snapshot(accounts, server_version=server_version)
+    try:
+        _atomic_write_json(SNAPSHOT_CACHE, snap, mode=0o600)
+    except OSError:
+        pass
+    return accounts, snap
 
 
-def build_json_snapshot(accounts):
+def fetch_all():
+    accounts, _ = fetch_snapshot()
+    return accounts
+
+
+def load_cached_snapshot(max_age=None):
+    """Load cached sanitized snapshot if present, matching base_url and age limit."""
+    try:
+        with open(SNAPSHOT_CACHE, encoding="utf-8") as fh:
+            snap = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(snap, dict) or snap.get("base_url") != get_base_url():
+        return None
+    if max_age is not None:
+        fetched = _parse_iso_ts(snap.get("fetched_at"))
+        if not fetched:
+            return None
+        age = (datetime.now(timezone.utc) - fetched).total_seconds()
+        if age > max_age:
+            return None
+    return snap
+
+
+def accounts_from_snapshot(snap):
+    """Convert a cached JSON snapshot back into internal account dicts for rendering."""
+    out = []
+    for a in (snap or {}).get("accounts") or []:
+        rows = []
+        row_details = {}
+        for w in a.get("windows") or []:
+            rows.append((w.get("label", ""), w.get("used_percent"), w.get("reset_at"), w.get("note", "")))
+            if w.get("models"):
+                row_details[w.get("label", "")] = w["models"]
+        item = {
+            "provider": a.get("provider", "proxy"),
+            "label": a.get("label", ""),
+            "plan": a.get("plan", ""),
+            "status": a.get("status", "active"),
+            "status_message": a.get("status_message", ""),
+            "cooldowns": a.get("cooldowns") or [],
+            "recent_ok": a.get("recent_requests", 0),
+            "recent_fail": a.get("recent_errors", 0),
+            "rows": rows,
+            "row_details": row_details,
+            "error": a.get("error", ""),
+            "disabled": bool(a.get("disabled")),
+        }
+        if "resets" in a:
+            item["resets"] = a["resets"]
+            item["resets_expire"] = a.get("resets_expire", "")
+        out.append(item)
+    return out
+
+
+def build_json_snapshot(accounts, server_version=""):
     """Build a sanitized, machine-readable JSON snapshot (no tokens or raw bodies)."""
     worst_overall = max((r[1] for a in accounts for r in a["rows"] if r[1] is not None), default=None)
+    total_ok = sum(int(a.get("recent_ok") or 0) for a in accounts)
+    total_fail = sum(int(a.get("recent_fail") or 0) for a in accounts)
     return {
         "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "base_url": get_base_url(),
+        "server_version": server_version,
         "summary": {
             "accounts": len(accounts),
             "errors": sum(1 for a in accounts if a.get("error")),
             "disabled": sum(1 for a in accounts if a.get("disabled")),
+            "cooldowns": sum(len(a.get("cooldowns") or []) for a in accounts),
+            "recent_requests": total_ok,
+            "recent_errors": total_fail,
             "highest_used_percent": round(worst_overall, 1) if worst_overall is not None else None,
         },
         "accounts": [
@@ -573,9 +733,13 @@ def build_json_snapshot(accounts):
                 "provider": a["provider"],
                 "label": a["label"],
                 "status": a.get("status", "active"),
+                "status_message": a.get("status_message", ""),
                 "plan": a.get("plan", ""),
                 "disabled": bool(a.get("disabled")),
                 "error": a.get("error", ""),
+                "cooldowns": a.get("cooldowns") or [],
+                "recent_requests": int(a.get("recent_ok") or 0),
+                "recent_errors": int(a.get("recent_fail") or 0),
                 **({"resets": a["resets"], "resets_expire": a.get("resets_expire", "")} if "resets" in a else {}),
                 "windows": [
                     {
@@ -585,6 +749,7 @@ def build_json_snapshot(accounts):
                         "reset_at": reset,
                         "reset_in": when(reset)[0] if reset else "",
                         "note": note,
+                        **({"models": a["row_details"][label]} if (a.get("row_details") or {}).get(label) else {}),
                     }
                     for label, pct, reset, note in a["rows"]
                 ],
@@ -594,7 +759,185 @@ def build_json_snapshot(accounts):
     }
 
 
+def filter_accounts(accounts, providers=None):
+    if not providers:
+        return accounts
+    wanted = {p.strip().lower() for p in providers if p.strip()}
+    if not wanted:
+        return accounts
+    aliases = {"gemini": "gemini-cli", "anthropic": "claude"}
+    wanted = {aliases.get(w, w) for w in wanted}
+    return [a for a in accounts if a.get("provider", "").lower() in wanted]
+
+
+def compute_notifications(prev_state, accounts, thresholds=None):
+    """Compare current accounts against prev_state and return (events, new_state).
+
+    Each event is (urgency, title, body).
+    """
+    th = sorted(thresholds or DEFAULT_THRESHOLDS)
+    prev_win = (prev_state or {}).get("windows") or {}
+    prev_err = (prev_state or {}).get("errors") or {}
+    new_win = {}
+    new_err = {}
+    events = []
+
+    for a in accounts:
+        if a.get("disabled") or a.get("provider") == "proxy":
+            continue
+        acct_key = f"{a['provider']}:{a['label']}"
+        pname = NAMES.get(a["provider"], a["provider"])
+        cur_err = a.get("error") or ""
+        new_err[acct_key] = cur_err
+        if cur_err and cur_err != prev_err.get(acct_key, ""):
+            events.append(("normal", f"{pname} quota error", f"{a['label']}: {cur_err}"))
+
+        for label, pct, reset, _note in a.get("rows") or []:
+            if pct is None:
+                continue
+            wkey = f"{acct_key}:{label}"
+            new_win[wkey] = round(pct, 1)
+            old = prev_win.get(wkey)
+            if old is None:
+                continue
+            rel = when(reset)[0]
+            suffix = f" (resets {rel})" if rel else ""
+            crossed = [t for t in th if old < t <= pct]
+            if crossed:
+                top = max(crossed)
+                urg = "critical" if top >= 100 else "normal"
+                events.append((urg, f"{pname} at {pct:.0f}%", f"{a['label']} · {label}{suffix}"))
+            elif old >= 100 and pct < 50:
+                events.append(("low", f"{pname} quota reset", f"{a['label']} · {label} is now {pct:.0f}%"))
+
+    return events, {"windows": new_win, "errors": new_err}
+
+
+def load_notify_state():
+    try:
+        with open(NOTIFY_STATE, encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_notify_state(state):
+    try:
+        _atomic_write_json(NOTIFY_STATE, state, mode=0o600)
+    except OSError:
+        pass
+
+
+def send_desktop_notification(urgency, title, body):
+    notify_bin = shutil.which("notify-send")
+    if not notify_bin:
+        return
+    try:
+        subprocess.Popen(
+            [notify_bin, "-a", "AI Quota", "-u", urgency, "-i", "utilities-system-monitor-symbolic", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def format_short(accounts):
+    per_prov = {}
+    for a in accounts:
+        vals = [r[1] for r in a["rows"] if r[1] is not None]
+        if vals:
+            per_prov[a["provider"]] = max(per_prov.get(a["provider"], 0.0), max(vals))
+    if not per_prov:
+        return "CPA: ok"
+    return " ".join(f"{SHORT_NAMES.get(p, p.upper())}:{v:.0f}%" for p, v in per_prov.items())
+
+
+def format_waybar(accounts):
+    text = format_short(accounts)
+    worst = max((r[1] for a in accounts for r in a["rows"] if r[1] is not None), default=0.0)
+    cls = "hot" if worst >= 80 else "warn" if worst >= 50 else "ok"
+    lines = []
+    for a in accounts:
+        head = f"{NAMES.get(a['provider'], a['provider'])} ({a['label']})"
+        if a.get("error"):
+            lines.append(f"{head}: {a['error']}")
+            continue
+        parts = []
+        for label, pct, reset, note in a["rows"]:
+            p = f"{pct:.0f}%" if pct is not None else "–"
+            tail = when(reset)[0] or note
+            parts.append(f"{label} {p}" + (f" ({tail})" if tail else ""))
+        lines.append(f"{head}: " + ", ".join(parts) if parts else head)
+    return {"text": text, "tooltip": "\n".join(lines), "class": cls}
+
+
+def format_table(accounts):
+    lines = []
+    for a in accounts:
+        extra = f" [{a['status']}]" if a.get("status") not in ("active", "ok", "") else ""
+        lines.append(f"{a['provider']:11} {a['label']:32} {a['plan']:6}{extra} {a['error']}".rstrip())
+        for c in a.get("cooldowns") or []:
+            rel = when(c.get("until"))[0]
+            lines.append(f"   Cooldown         {c.get('model', 'account'):16} {rel:10} {c.get('reason', '')}".rstrip())
+        for label, pct, reset, note in a["rows"]:
+            pct_str = f"{pct:3.0f}%" if pct is not None else "  – "
+            lines.append(f"   {label:<16} {pct_str}  {when(reset)[0]:10} {note}".rstrip())
+    return "\n".join(lines)
+
+
+def send_control_command(cmd):
+    """Send a command to an already-running tray instance; return True if delivered."""
+    if not os.path.exists(CONTROL_SOCK):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.5)
+            s.connect(CONTROL_SOCK)
+            s.sendall((cmd.strip() + "\n").encode("utf-8"))
+            return True
+    except OSError:
+        try:
+            os.unlink(CONTROL_SOCK)
+        except OSError:
+            pass
+        return False
+
+
+def _start_control_server(on_cmd):
+    os.makedirs(os.path.dirname(CONTROL_SOCK), exist_ok=True)
+    try:
+        os.unlink(CONTROL_SOCK)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(CONTROL_SOCK)
+    os.chmod(CONTROL_SOCK, 0o600)
+    srv.listen(4)
+
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            with conn:
+                try:
+                    data = conn.recv(256).decode("utf-8", "replace").strip()
+                    if data:
+                        on_cmd(data)
+                except OSError:
+                    pass
+
+    threading.Thread(target=loop, daemon=True).start()
+    return srv
+
+
 def run_gui(start_panel=False, pin=False):
+    if not pin and send_control_command("show" if start_panel else "toggle"):
+        return
+
     import cairo
     import gi
 
@@ -602,8 +945,14 @@ def run_gui(start_panel=False, pin=False):
     gi.require_version("Gdk", "3.0")
     from gi.repository import Gdk, Gio, GLib, Gtk
 
-    icon_dir = os.path.join(GLib.get_user_cache_dir(), "quota-view")
-    os.makedirs(icon_dir, exist_ok=True)
+    app_indicator_mod = None
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as app_indicator_mod
+    except (ValueError, ImportError):
+        app_indicator_mod = None
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
     colors = {"ok": (0.18, 0.64, 0.31), "warn": (0.75, 0.53, 0.0), "hot": (0.81, 0.13, 0.18)}
 
     def level(pct):
@@ -647,7 +996,7 @@ def run_gui(start_panel=False, pin=False):
                 cr.set_source_rgb(*colors[level(pct)])
                 cr.rectangle(x, h - fill, bw, fill)
                 cr.fill()
-        path = os.path.join(icon_dir, "tray.png")
+        path = os.path.join(CACHE_DIR, "tray.png")
         surf.write_to_png(path)
         return path
 
@@ -690,12 +1039,13 @@ def run_gui(start_panel=False, pin=False):
         .qv { border-radius: 6px; border: 1px solid alpha(@theme_fg_color, 0.18); }
         .qv-acct { font-weight: 600; }
         .qv-meta { opacity: 0.65; font-size: 0.9em; }
+        .qv-warn { color: #d97706; font-size: 0.88em; }
         .qv-pct { font-weight: 500; font-size: 0.9em; }
         .qv-hair { background-color: alpha(@theme_fg_color, 0.12); min-height: 1px; }
         .qv-badge { border-radius: 9px; padding: 0 6px 0 4px; font-size: 0.85em; font-weight: 600;
                     background-color: alpha(@theme_fg_color, 0.10); }
         """
-        W = 375
+        W = 385
 
         def __init__(self, tray):
             super().__init__(title="AI quota")
@@ -727,10 +1077,13 @@ def run_gui(start_panel=False, pin=False):
 
         def _place(self, *_):
             w = self.get_allocated_width() or self.W
-            ok, _screen, area, _ = self.tray.icon.get_geometry()
             mon = Gdk.Display.get_default().get_primary_monitor() or Gdk.Display.get_default().get_monitor(0)
             geo = mon.get_workarea()
-            x = (area.x + area.width // 2 - w // 2) if ok and area.width else geo.x + geo.width - w - 8
+            x = geo.x + geo.width - w - 8
+            if self.tray.status_icon is not None:
+                ok, _screen, area, _ = self.tray.status_icon.get_geometry()
+                if ok and area.width:
+                    x = area.x + area.width // 2 - w // 2
             self.move(max(geo.x, min(x, geo.x + geo.width - w - 4)), geo.y + 6)
 
         def render(self):
@@ -742,7 +1095,13 @@ def run_gui(start_panel=False, pin=False):
                 self.outer.pack_start(self._account(a), False, False, 0)
             foot = Gtk.Box(spacing=6)
             host = re.sub(r"^https?://", "", get_base_url())
-            status_txt = f"Updated {self.tray.updated} · {host}" if self.tray.updated else f"Loading · {host}…"
+            reqs = sum(int(a.get("recent_ok") or 0) for a in self.tray.accounts)
+            req_part = f" · {reqs} reqs" if reqs else ""
+            status_txt = (
+                f"Updated {self.tray.updated}{req_part} · {host}"
+                if self.tray.updated
+                else f"Loading · {host}…"
+            )
             upd = Gtk.Label(label=status_txt, xalign=0, ellipsize=3)
             upd.get_style_context().add_class("qv-meta")
             foot.pack_start(upd, True, True, 0)
@@ -792,17 +1151,34 @@ def run_gui(start_panel=False, pin=False):
             row = 1
             if a["error"]:
                 e = Gtk.Label(label=a["error"], xalign=0, wrap=True)
-                e.get_style_context().add_class("qv-meta")
+                e.get_style_context().add_class("qv-warn")
                 g.attach(e, 1, row, 3, 1)
+                row += 1
+            for cd in a.get("cooldowns") or []:
+                rel = when(cd.get("until"))[0]
+                cd_txt = f"Cooldown: {cd.get('model', 'account')}" + (f" ({rel})" if rel else "")
+                lbl = Gtk.Label(label=cd_txt, xalign=0, ellipsize=3)
+                lbl.get_style_context().add_class("qv-warn")
+                g.attach(lbl, 1, row, 3, 1)
                 row += 1
             for label, pct, reset, note in a["rows"]:
                 name = Gtk.Label(label=label, xalign=0, ellipsize=3)
                 name.get_style_context().add_class("qv-meta")
+                details = (a.get("row_details") or {}).get(label)
+                if details:
+                    tip_lines = [
+                        f"{m['name']}: {m['used_percent']:.0f}%"
+                        + (f" ({when(m.get('reset_at'))[0]})" if m.get("reset_at") else "")
+                        for m in details
+                    ]
+                    name.set_tooltip_text("\n".join(tip_lines))
                 self.cols[0].add_widget(name)
                 g.attach(name, 1, row, 1, 1)
                 bar = Gtk.DrawingArea(hexpand=True, valign=Gtk.Align.CENTER)
                 bar.set_size_request(120, 5)
                 bar.connect("draw", lambda w, cr, p=pct: draw_bar(cr, 0, 0, w.get_allocated_width(), 5, p))
+                if details:
+                    bar.set_tooltip_text(name.get_tooltip_text())
                 g.attach(bar, 2, row, 1, 1)
                 rel, _ = when(reset)
                 right = f"{pct:.0f}%" if pct is not None else "–"
@@ -825,60 +1201,53 @@ def run_gui(start_panel=False, pin=False):
     class Tray:
         def __init__(self):
             self.theme = Theme()
-            self.icon = Gtk.StatusIcon()
-            self.icon.set_from_icon_name("utilities-system-monitor-symbolic")
-            self.icon.set_tooltip_text("AI quota")
-            self.icon.set_title("AI quota")
-            self.icon.connect("activate", self.toggle)
-            self.icon.connect("popup-menu", self.popup)
-            self.accounts, self.updated, self.panel = [], None, Panel(self)
+            self.notifications_enabled = bool(load_settings().get("notifications", True))
+            self.notify_state = load_notify_state()
+            self.accounts, self.updated = [], None
+            self.status_icon = None
+            self.indicator = None
+            self.panel = Panel(self)
+
+            backend = str(load_settings().get("tray_backend", "auto")).lower()
+            use_indicator = (
+                app_indicator_mod is not None
+                and (backend == "appindicator" or (backend == "auto" and os.environ.get("XDG_SESSION_TYPE") == "wayland"))
+            )
+            if use_indicator:
+                self.indicator = app_indicator_mod.Indicator.new(
+                    "cpa-quota-view",
+                    "utilities-system-monitor-symbolic",
+                    app_indicator_mod.IndicatorCategory.APPLICATION_STATUS,
+                )
+                self.indicator.set_status(app_indicator_mod.IndicatorStatus.ACTIVE)
+                self.indicator.set_menu(self._build_menu(include_toggle=True))
+            else:
+                self.status_icon = Gtk.StatusIcon()
+                self.status_icon.set_from_icon_name("utilities-system-monitor-symbolic")
+                self.status_icon.set_tooltip_text("AI quota")
+                self.status_icon.set_title("AI quota")
+                self.status_icon.connect("activate", self.toggle)
+                self.status_icon.connect("popup-menu", self.popup)
+
+            # Hydrate immediately from disk cache if available for instant startup.
+            cached = load_cached_snapshot()
+            if cached:
+                self._apply(accounts_from_snapshot(cached), from_cache=True)
+
             self.refresh()
             GLib.timeout_add_seconds(get_refresh_sec(), self.refresh)
 
-        def refresh(self, *_):
-            threading.Thread(target=self._fetch, daemon=True).start()
-            return True
+        def _toggle_notifications(self, widget):
+            self.notifications_enabled = widget.get_active()
+            save_settings({**load_settings(), "notifications": self.notifications_enabled})
 
-        def _fetch(self):
-            try:
-                accounts = fetch_all()
-            except Exception as e:
-                accounts = [{
-                    "provider": "proxy",
-                    "label": "CLIProxyAPI",
-                    "plan": "",
-                    "status": "error",
-                    "rows": [],
-                    "error": str(e)[:90],
-                }]
-            GLib.idle_add(self._apply, accounts)
-
-        def _apply(self, accounts):
-            self.accounts, self.updated = accounts, time.strftime("%H:%M")
-            self.icon.set_from_file(tray_icon(accounts))
-            per_prov = {}
-            for a in accounts:
-                vals = [r[1] for r in a["rows"] if r[1] is not None]
-                if vals:
-                    per_prov[a["provider"]] = max(per_prov.get(a["provider"], 0), max(vals))
-            if per_prov:
-                summary = " · ".join(f"{NAMES.get(p, p)} {v:.0f}%" for p, v in per_prov.items())
-                self.icon.set_tooltip_text(f"AI quota · {summary}")
-            else:
-                self.icon.set_tooltip_text("AI quota")
-            self.panel.render()
-            return False
-
-        def toggle(self, *_):
-            if self.panel.get_visible():
-                self.panel.hide()
-            else:
-                self.panel.render()
-                self.panel.show_all()
-                self.panel.present()
-
-        def popup(self, icon, button, t):
+        def _build_menu(self, include_toggle=False):
             m = Gtk.Menu()
+            if include_toggle:
+                tog = Gtk.MenuItem(label="Show / Hide Quota Panel")
+                tog.connect("activate", self.toggle)
+                m.append(tog)
+                m.append(Gtk.SeparatorMenuItem())
             for text, cb in (
                 ("Refresh", self.refresh),
                 ("Open CPA dashboard", open_dashboard),
@@ -888,6 +1257,11 @@ def run_gui(start_panel=False, pin=False):
                 it = Gtk.MenuItem(label=text)
                 it.connect("activate", cb)
                 m.append(it)
+            m.append(Gtk.SeparatorMenuItem())
+            notif = Gtk.CheckMenuItem(label="Desktop notifications")
+            notif.set_active(self.notifications_enabled)
+            notif.connect("toggled", self._toggle_notifications)
+            m.append(notif)
             m.append(Gtk.SeparatorMenuItem())
             group = None
             for mode, text in (("system", "System theme"), ("light", "Light"), ("dark", "Dark")):
@@ -901,32 +1275,171 @@ def run_gui(start_panel=False, pin=False):
             q.connect("activate", Gtk.main_quit)
             m.append(q)
             m.show_all()
+            return m
+
+        def refresh(self, *_):
+            threading.Thread(target=self._fetch, daemon=True).start()
+            return True
+
+        def _fetch(self):
+            try:
+                accounts, _ = fetch_snapshot()
+            except Exception as e:
+                accounts = [{
+                    "provider": "proxy",
+                    "label": "CLIProxyAPI",
+                    "plan": "",
+                    "status": "error",
+                    "status_message": "",
+                    "cooldowns": [],
+                    "recent_ok": 0,
+                    "recent_fail": 0,
+                    "rows": [],
+                    "row_details": {},
+                    "error": str(e)[:90],
+                }]
+            GLib.idle_add(self._apply, accounts, False)
+
+        def _apply(self, accounts, from_cache=False):
+            self.accounts = accounts
+            self.updated = "cached" if from_cache else time.strftime("%H:%M")
+            icon_path = tray_icon(accounts)
+            if self.status_icon is not None:
+                self.status_icon.set_from_file(icon_path)
+                per_prov = {}
+                for a in accounts:
+                    vals = [r[1] for r in a["rows"] if r[1] is not None]
+                    if vals:
+                        per_prov[a["provider"]] = max(per_prov.get(a["provider"], 0), max(vals))
+                if per_prov:
+                    summary = " · ".join(f"{NAMES.get(p, p)} {v:.0f}%" for p, v in per_prov.items())
+                    self.status_icon.set_tooltip_text(f"AI quota · {summary}")
+                else:
+                    self.status_icon.set_tooltip_text("AI quota")
+            elif self.indicator is not None:
+                self.indicator.set_icon_full(icon_path, "AI quota")
+
+            if not from_cache:
+                events, new_state = compute_notifications(
+                    self.notify_state, accounts, thresholds=get_notify_thresholds()
+                )
+                self.notify_state = new_state
+                save_notify_state(new_state)
+                if self.notifications_enabled:
+                    for urg, title, body in events:
+                        send_desktop_notification(urg, title, body)
+
+            self.panel.render()
+            return False
+
+        def show_panel(self, *_):
+            self.panel.render()
+            self.panel.show_all()
+            self.panel.present()
+
+        def toggle(self, *_):
+            if self.panel.get_visible():
+                self.panel.hide()
+            else:
+                self.show_panel()
+
+        def popup(self, icon, button, t):
+            m = self._build_menu(include_toggle=False)
             m.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, t)
 
     tray = Tray()
+
+    def handle_cmd(cmd):
+        if cmd == "show":
+            GLib.idle_add(tray.show_panel)
+        elif cmd == "toggle":
+            GLib.idle_add(tray.toggle)
+        elif cmd == "refresh":
+            GLib.idle_add(tray.refresh)
+
+    srv = _start_control_server(handle_cmd)
     if start_panel:
-        GLib.timeout_add(3000, tray.toggle)
-    Gtk.main()
+        GLib.timeout_add(400, tray.show_panel)
+    try:
+        Gtk.main()
+    finally:
+        try:
+            srv.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(CONTROL_SOCK)
+        except OSError:
+            pass
+
+
+def _load_accounts_for_cli(max_age=None, providers=None):
+    snap = load_cached_snapshot(max_age=max_age) if max_age is not None else None
+    if snap is not None:
+        accounts = accounts_from_snapshot(snap)
+    else:
+        accounts, snap = fetch_snapshot()
+    accounts = filter_accounts(accounts, providers)
+    if providers:
+        snap = build_json_snapshot(accounts, server_version=snap.get("server_version", ""))
+    return accounts, snap
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Tray and CLI quota viewer for CLIProxyAPI.")
     parser.add_argument("--print", dest="print_table", action="store_true", help="Print quota summary and exit")
     parser.add_argument("--json", dest="print_json", action="store_true", help="Print sanitized JSON snapshot and exit")
-    parser.add_argument("--panel", action="store_true", help="Open the popup panel shortly after launch")
+    parser.add_argument("--short", action="store_true", help="Print compact one-line summary (e.g. for tmux/prompts)")
+    parser.add_argument("--waybar", action="store_true", help="Print Waybar custom-module JSON and exit")
+    parser.add_argument("--watch", nargs="?", const=60, type=int, metavar="SECS", help="Live-refreshing terminal view")
+    parser.add_argument("--provider", action="append", help="Filter by provider (repeatable or comma-separated)")
+    parser.add_argument("--max-age", type=int, metavar="SECS", help="Reuse cached snapshot if newer than SECS")
+    parser.add_argument("--cached", action="store_true", help="Shortcut for --max-age 300")
+    parser.add_argument("--fail-above", type=float, metavar="PCT", help="Exit with status 2 if any window >= PCT")
+    parser.add_argument("--refresh", action="store_true", help="Ask running tray instance to refresh immediately")
+    parser.add_argument("--panel", action="store_true", help="Open the popup panel (toggles existing tray if running)")
     parser.add_argument("--pin", action="store_true", help="Keep the popup panel open when focus leaves")
     args = parser.parse_args(argv)
 
-    if args.print_json:
-        print(json.dumps(build_json_snapshot(fetch_all()), indent=2))
-        return 0
+    if args.refresh:
+        if send_control_command("refresh"):
+            return 0
+        print("quota-view: no running tray instance found", file=sys.stderr)
+        return 1
 
-    if args.print_table:
-        for a in fetch_all():
-            print(f"{a['provider']:11} {a['label']:32} {a['plan']:6} {a['error']}")
-            for label, pct, reset, note in a["rows"]:
-                pct_str = f"{pct:3.0f}%" if pct is not None else "  – "
-                print(f"   {label:<16} {pct_str}  {when(reset)[0]:10} {note}")
+    providers = []
+    for p in args.provider or []:
+        providers.extend(p.split(","))
+    max_age = args.max_age if args.max_age is not None else (300 if args.cached else None)
+
+    if args.watch is not None:
+        interval = max(15, args.watch)
+        try:
+            while True:
+                accounts, snap = _load_accounts_for_cli(max_age=None, providers=providers)
+                sys.stdout.write("\033[2J\033[H")
+                print(f"CLIProxyAPI Quota · {get_base_url()} · {time.strftime('%H:%M:%S')} (every {interval}s)\n")
+                print(format_table(accounts))
+                sys.stdout.flush()
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return 0
+
+    cli_mode = args.print_json or args.print_table or args.short or args.waybar or args.fail_above is not None
+    if cli_mode:
+        accounts, snap = _load_accounts_for_cli(max_age=max_age, providers=providers)
+        if args.print_json:
+            print(json.dumps(snap, indent=2))
+        elif args.waybar:
+            print(json.dumps(format_waybar(accounts)))
+        elif args.short:
+            print(format_short(accounts))
+        elif args.print_table:
+            print(format_table(accounts))
+        if args.fail_above is not None:
+            worst = max((r[1] for a in accounts for r in a["rows"] if r[1] is not None), default=0.0)
+            if worst >= args.fail_above:
+                return 2
         return 0
 
     run_gui(start_panel=args.panel, pin=args.pin)
