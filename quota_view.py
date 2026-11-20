@@ -51,7 +51,8 @@ HEADERS = {
         "Authorization": "Bearer $TOKEN$",
         "Content-Type": "application/json",
         "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/2.1.0",
+        "x-app": "cli",
+        "User-Agent": "claude-cli/2.1.329 (external, cli)",
     },
     "codex": {
         "Authorization": "Bearer $TOKEN$",
@@ -83,7 +84,7 @@ HEADERS = {
 }
 
 GET_URLS = {
-    "claude": "https://api.anthropic.com/api/oauth/usage",
+    "claude": "https://api.anthropic.com/api/oauth/usage?cedar_ember=1",
     "codex": "https://chatgpt.com/backend-api/wham/usage",
     "kimi": "https://api.kimi.com/coding/v1/usages",
     "xai": "https://cli-chat-proxy.grok.com/v1/billing",
@@ -479,6 +480,30 @@ def rows_for(provider, body):
     return rows
 
 
+def parse_claude_meta(body):
+    """Extract plan tier and manual limit-reset grants from Claude's cedar_ember payload."""
+    ce = (body or {}).get("cedar_ember")
+    if not isinstance(ce, dict):
+        return "", None, "", []
+    tier_raw = str(((ce.get("event_props") or {}).get("tier")) or "").strip()
+    plan = ""
+    if tier_raw:
+        plan = re.sub(r"^(default_)?claude_", "", tier_raw).replace("_", " ").strip()
+    grants = ce.get("grants")
+    if not isinstance(grants, list) or not grants:
+        return plan, None, "", []
+    avail = [g for g in grants if isinstance(g, dict) and int(g.get("resets_left") or 0) > 0]
+    total_left = sum(int(g.get("resets_left") or 0) for g in avail)
+    exp = min((g.get("ends_at") for g in avail if g.get("ends_at")), default=None)
+    details = [
+        f"{g.get('label') or g.get('id')} ({int(g.get('resets_left') or 0)} left"
+        + (f", expires {when(g.get('ends_at'))[0]}" if g.get("ends_at") else "")
+        + ")"
+        for g in avail
+    ]
+    return plan, total_left, (when(exp)[0] if exp else ""), details
+
+
 def passive_claude_rows(auth_entry):
     """Fallback to passive Anthropic rate-limit headers captured by CLIProxyAPI."""
     sig = ((auth_entry.get("quota") or {}).get("signals")) or {}
@@ -608,6 +633,15 @@ def _fetch_one(key, f):
         body = api_call(key, auth_index, GET_URLS[provider], hdr)
         acct["rows"] = rows_for(provider, body)
         acct["plan"] = str(body.get("plan_type") or "") if isinstance(body, dict) else ""
+        if provider == "claude" and isinstance(body, dict):
+            plan, resets, exp_str, reset_details = parse_claude_meta(body)
+            if plan and not acct["plan"]:
+                acct["plan"] = plan
+            if resets is not None:
+                acct["resets"] = resets
+                acct["resets_expire"] = exp_str
+                if reset_details:
+                    acct["resets_details"] = reset_details
         if provider == "codex":  # manual "full reset" credits; only Codex offers these
             try:
                 cr = api_call(
@@ -706,6 +740,8 @@ def accounts_from_snapshot(snap):
         if "resets" in a:
             item["resets"] = a["resets"]
             item["resets_expire"] = a.get("resets_expire", "")
+            if a.get("resets_details"):
+                item["resets_details"] = a["resets_details"]
         out.append(item)
     return out
 
@@ -740,7 +776,15 @@ def build_json_snapshot(accounts, server_version=""):
                 "cooldowns": a.get("cooldowns") or [],
                 "recent_requests": int(a.get("recent_ok") or 0),
                 "recent_errors": int(a.get("recent_fail") or 0),
-                **({"resets": a["resets"], "resets_expire": a.get("resets_expire", "")} if "resets" in a else {}),
+                **(
+                    {
+                        "resets": a["resets"],
+                        "resets_expire": a.get("resets_expire", ""),
+                        **({"resets_details": a["resets_details"]} if a.get("resets_details") else {}),
+                    }
+                    if "resets" in a
+                    else {}
+                ),
                 "windows": [
                     {
                         "label": label,
@@ -829,17 +873,41 @@ def save_notify_state(state):
         pass
 
 
-def send_desktop_notification(urgency, title, body):
-    notify_bin = shutil.which("notify-send")
-    if not notify_bin:
-        return
+_notif_ids = {}
+
+
+def send_desktop_notification(urgency, title, body, key=None):
+    """Send a bounded desktop notification via D-Bus, replacing any prior one for the same key."""
     try:
-        subprocess.Popen(
-            [notify_bin, "-a", "AI Quota", "-u", urgency, "-i", "utilities-system-monitor-symbolic", title, body],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        urg_byte = {"low": 0, "normal": 1, "critical": 2}.get(urgency, 1)
+        replaces_id = _notif_ids.get(key or title, 0)
+        res = bus.call_sync(
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "Notify",
+            GLib.Variant(
+                "(susssasa{sv}i)",
+                (
+                    "AI Quota",
+                    replaces_id,
+                    "utilities-system-monitor-symbolic",
+                    title,
+                    body,
+                    [],
+                    {"urgency": GLib.Variant("y", urg_byte)},
+                    6000,
+                ),
+            ),
+            GLib.VariantType("(u)"),
+            Gio.DBusCallFlags.NONE,
+            2000,
+            None,
         )
-    except OSError:
+        _notif_ids[key or title] = res.unpack()[0]
+    except Exception:
         pass
 
 
@@ -877,7 +945,8 @@ def format_table(accounts):
     lines = []
     for a in accounts:
         extra = f" [{a['status']}]" if a.get("status") not in ("active", "ok", "") else ""
-        lines.append(f"{a['provider']:11} {a['label']:32} {a['plan']:6}{extra} {a['error']}".rstrip())
+        resets_str = f" [resets:{a['resets']}]" if a.get("resets") else ""
+        lines.append(f"{a['provider']:11} {a['label']:32} {a['plan']:7}{resets_str}{extra} {a['error']}".rstrip())
         for c in a.get("cooldowns") or []:
             rel = when(c.get("until"))[0]
             lines.append(f"   Cooldown         {c.get('model', 'account'):16} {rel:10} {c.get('reason', '')}".rstrip())
@@ -997,7 +1066,10 @@ def run_gui(start_panel=False, pin=False):
                 cr.rectangle(x, h - fill, bw, fill)
                 cr.fill()
         path = os.path.join(CACHE_DIR, "tray.png")
-        surf.write_to_png(path)
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        surf.write_to_png(tmp_path)
+        os.replace(tmp_path, path)
         return path
 
     class Theme:
@@ -1141,7 +1213,11 @@ def run_gui(start_panel=False, pin=False):
                 badge.pack_start(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.MENU), False, False, 0)
                 badge.pack_start(Gtk.Label(label=str(a["resets"])), False, False, 0)
                 tip = f"{a['resets']} manual reset{'s' if a['resets'] != 1 else ''} available"
-                badge.set_tooltip_text(tip + (f" · first expires {a['resets_expire']}" if a.get("resets_expire") else ""))
+                if a.get("resets_expire"):
+                    tip += f" · first expires {a['resets_expire']}"
+                if a.get("resets_details"):
+                    tip += "\n" + "\n".join(a["resets_details"])
+                badge.set_tooltip_text(tip)
                 head.pack_start(badge, False, False, 0)
             g.attach(head, 1, 0, 2, 1)
             if a["plan"]:
@@ -1204,6 +1280,7 @@ def run_gui(start_panel=False, pin=False):
             self.notifications_enabled = bool(load_settings().get("notifications", False))
             self.notify_state = load_notify_state()
             self.accounts, self.updated = [], None
+            self._fetching = False
             self.status_icon = None
             self.indicator = None
             self.panel = Panel(self)
@@ -1278,6 +1355,9 @@ def run_gui(start_panel=False, pin=False):
             return m
 
         def refresh(self, *_):
+            if self._fetching:
+                return True
+            self._fetching = True
             threading.Thread(target=self._fetch, daemon=True).start()
             return True
 
@@ -1298,38 +1378,47 @@ def run_gui(start_panel=False, pin=False):
                     "row_details": {},
                     "error": str(e)[:90],
                 }]
+            finally:
+                self._fetching = False
             GLib.idle_add(self._apply, accounts, False)
 
         def _apply(self, accounts, from_cache=False):
-            self.accounts = accounts
-            self.updated = "cached" if from_cache else time.strftime("%H:%M")
-            icon_path = tray_icon(accounts)
-            if self.status_icon is not None:
-                self.status_icon.set_from_file(icon_path)
-                per_prov = {}
-                for a in accounts:
-                    vals = [r[1] for r in a["rows"] if r[1] is not None]
-                    if vals:
-                        per_prov[a["provider"]] = max(per_prov.get(a["provider"], 0), max(vals))
-                if per_prov:
-                    summary = " · ".join(f"{NAMES.get(p, p)} {v:.0f}%" for p, v in per_prov.items())
-                    self.status_icon.set_tooltip_text(f"AI quota · {summary}")
-                else:
-                    self.status_icon.set_tooltip_text("AI quota")
-            elif self.indicator is not None:
-                self.indicator.set_icon_full(icon_path, "AI quota")
+            try:
+                self.accounts = accounts
+                self.updated = "cached" if from_cache else time.strftime("%H:%M")
+                try:
+                    icon_path = tray_icon(accounts)
+                except Exception:
+                    icon_path = None
+                if self.status_icon is not None:
+                    if icon_path:
+                        self.status_icon.set_from_file(icon_path)
+                    per_prov = {}
+                    for a in accounts:
+                        vals = [r[1] for r in a["rows"] if r[1] is not None]
+                        if vals:
+                            per_prov[a["provider"]] = max(per_prov.get(a["provider"], 0), max(vals))
+                    if per_prov:
+                        summary = " · ".join(f"{NAMES.get(p, p)} {v:.0f}%" for p, v in per_prov.items())
+                        self.status_icon.set_tooltip_text(f"AI quota · {summary}")
+                    else:
+                        self.status_icon.set_tooltip_text("AI quota")
+                elif self.indicator is not None and icon_path:
+                    self.indicator.set_icon_full(icon_path, "AI quota")
 
-            if not from_cache:
-                events, new_state = compute_notifications(
-                    self.notify_state, accounts, thresholds=get_notify_thresholds()
-                )
-                self.notify_state = new_state
-                save_notify_state(new_state)
-                if self.notifications_enabled:
-                    for urg, title, body in events:
-                        send_desktop_notification(urg, title, body)
+                if not from_cache:
+                    events, new_state = compute_notifications(
+                        self.notify_state, accounts, thresholds=get_notify_thresholds()
+                    )
+                    self.notify_state = new_state
+                    save_notify_state(new_state)
+                    if self.notifications_enabled:
+                        for urg, title, body in events[:4]:
+                            send_desktop_notification(urg, title, body, key=f"{title}:{body.split('·')[0].strip()}")
 
-            self.panel.render()
+                self.panel.render()
+            except Exception as exc:
+                print(f"quota-view: _apply error: {exc}", file=sys.stderr)
             return False
 
         def show_panel(self, *_):

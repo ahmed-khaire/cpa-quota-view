@@ -31,6 +31,24 @@ class QuotaViewTests(unittest.TestCase):
         self.assertEqual(rows[2][3], "active limit")
         self.assertEqual(rows[3][3], "$4.5 used")
 
+    def test_claude_cedar_ember_meta(self):
+        payload = {
+            "cedar_ember": {
+                "eligible": True,
+                "event_props": {"tier": "claude_max_20x"},
+                "grants": [
+                    {"id": "full-reset-2611", "label": "One full limit reset", "resets_left": 0, "ends_at": "2026-12-10T22:00:00+00:00"},
+                    {"id": "launch-2610-fable", "label": "Fable reset", "resets_left": 1, "ends_at": "2027-03-09T07:59:00+00:00"},
+                ],
+            }
+        }
+        plan, resets, exp, details = qv.parse_claude_meta(payload)
+        self.assertEqual(plan, "max 20x")
+        self.assertEqual(resets, 1)
+        self.assertTrue(bool(exp))
+        self.assertEqual(len(details), 1)
+        self.assertIn("Fable reset", details[0])
+
     def test_passive_claude_fallback(self):
         entry = {
             "quota": {
