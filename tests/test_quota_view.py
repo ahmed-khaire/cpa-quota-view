@@ -135,6 +135,16 @@ class QuotaViewTests(unittest.TestCase):
         rel_past, _ = qv.when("2026-11-20T23:00:00Z", now=now)
         self.assertEqual(rel_past, "now")
 
+    def test_format_plan_and_error_message(self):
+        self.assertEqual(qv.format_plan("max 20x"), "Max 20x")
+        self.assertEqual(qv.format_plan("pro"), "Pro")
+        raw = 'unavailable: {"type":"error","error":{"type":"rate_limit_error","message":"Weekly limit reached"}}'
+        self.assertEqual(qv.format_error_message(raw), "Unavailable: Rate limit error: Weekly limit reached")
+        self.assertEqual(
+            qv.format_cooldown_line({"model": "credential", "reason": "credential_quota", "until": None}),
+            "Cooldown (credential) · credential quota",
+        )
+
     def test_cooldown_parsing_and_formatting(self):
         cds = qv.parse_cooldowns({
             "cooldowns": [

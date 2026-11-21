@@ -535,6 +535,58 @@ def parse_cooldowns(auth_entry):
     return out
 
 
+def format_plan(plan):
+    """Human-friendly plan label that preserves multiplier casing (e.g. 'max 20x' -> 'Max 20x')."""
+    text = str(plan or "").strip()
+    if not text:
+        return ""
+    return " ".join(w if re.match(r"^\d+x$", w, re.I) else w.capitalize() for w in text.split())
+
+
+def format_error_message(raw, status=""):
+    """Extract a readable message from raw provider/CPA error payloads (including JSON)."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # Strip leading "<status>: " prefix if already present
+    prefix = ""
+    m = re.match(r"^(unavailable|error|rate_limited|unauthorized|forbidden):\s*(.+)$", text, re.S | re.I)
+    if m:
+        prefix, body = m.group(1).lower(), m.group(2).strip()
+    else:
+        body = text
+    if body.startswith("{"):
+        try:
+            obj = json.loads(body)
+            err = obj.get("error") if isinstance(obj, dict) else None
+            if isinstance(err, dict):
+                etype = str(err.get("type") or "").replace("_", " ").strip()
+                msg = str(err.get("message") or "").strip()
+                if etype and msg:
+                    body = f"{etype.capitalize()}: {msg}"
+                elif msg:
+                    body = msg
+            elif isinstance(obj, dict) and obj.get("message"):
+                body = str(obj["message"]).strip()
+        except ValueError:
+            pass
+    if status and status not in ("active", "ok", "") and not prefix and not body.lower().startswith(status.lower()):
+        return f"{status.capitalize()}: {body}"
+    return f"{prefix.capitalize()}: {body}" if prefix else body
+
+
+def format_cooldown_line(cd):
+    model = str(cd.get("model") or "account")
+    reason = str(cd.get("reason") or "").replace("_", " ").strip()
+    rel = when(cd.get("until"))[0]
+    parts = [f"Cooldown ({model})"]
+    if reason:
+        parts.append(reason)
+    if rel:
+        parts.append(f"resets {rel}")
+    return " · ".join(parts)
+
+
 def recent_request_totals(auth_entry):
     buckets = auth_entry.get("recent_requests") or []
     ok = sum(int(b.get("success") or 0) for b in buckets if isinstance(b, dict))
@@ -582,7 +634,7 @@ def _fetch_one(key, f):
         return acct
 
     if status not in ("active", "ok", "") and status_msg:
-        acct["error"] = f"{status}: {status_msg}"[:90]
+        acct["error"] = format_error_message(status_msg, status=status)
 
     auth_index = f.get("auth_index") or f.get("authIndex")
     if provider == "vertex":
@@ -1112,6 +1164,10 @@ def run_gui(start_panel=False, pin=False):
         .qv-acct { font-weight: 600; }
         .qv-meta { opacity: 0.65; font-size: 0.9em; }
         .qv-warn { color: #d97706; font-size: 0.88em; }
+        .qv-alert-btn { padding: 0 3px; min-height: 18px; min-width: 18px; color: #d97706; }
+        .qv-alert-btn:hover { background-color: alpha(#d97706, 0.14); border-radius: 4px; }
+        .qv-pop-title { font-weight: 600; font-size: 0.92em; color: #d97706; }
+        .qv-pop-body { font-size: 0.88em; }
         .qv-pct { font-weight: 500; font-size: 0.9em; }
         .qv-hair { background-color: alpha(@theme_fg_color, 0.12); min-height: 1px; }
         .qv-badge { border-radius: 9px; padding: 0 6px 0 4px; font-size: 0.85em; font-weight: 600;
@@ -1122,6 +1178,7 @@ def run_gui(start_panel=False, pin=False):
         def __init__(self, tray):
             super().__init__(title="AI quota")
             self.tray = tray
+            self._open_popovers = 0
             self.set_decorated(False)
             self.set_resizable(False)
             self.set_keep_above(True)
@@ -1129,7 +1186,7 @@ def run_gui(start_panel=False, pin=False):
             self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
             self.set_default_size(self.W, -1)
             if not pin:
-                self.connect("focus-out-event", lambda *a: (self.hide(), False)[1])
+                self.connect("focus-out-event", self._on_focus_out)
             self.connect(
                 "key-press-event",
                 lambda w, e: (self.hide(), True)[1] if e.keyval == Gdk.KEY_Escape else False,
@@ -1146,6 +1203,12 @@ def run_gui(start_panel=False, pin=False):
             self.add(self.outer)
             self.connect("map", self._place)
             self.cols = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(2)]
+
+        def _on_focus_out(self, *_):
+            if self._open_popovers > 0:
+                return False
+            self.hide()
+            return False
 
         def _place(self, *_):
             w = self.get_allocated_width() or self.W
@@ -1207,7 +1270,7 @@ def run_gui(start_panel=False, pin=False):
             acct.get_style_context().add_class("qv-acct")
             head = Gtk.Box(spacing=6)
             head.pack_start(acct, False, False, 0)
-            if a.get("resets") is not None:
+            if (a.get("resets") or 0) > 0:
                 badge = Gtk.Box(spacing=3, valign=Gtk.Align.CENTER)
                 badge.get_style_context().add_class("qv-badge")
                 badge.pack_start(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.MENU), False, False, 0)
@@ -1219,24 +1282,46 @@ def run_gui(start_panel=False, pin=False):
                     tip += "\n" + "\n".join(a["resets_details"])
                 badge.set_tooltip_text(tip)
                 head.pack_start(badge, False, False, 0)
+            issues = []
+            if a.get("error"):
+                issues.append(format_error_message(a["error"]))
+            for cd in a.get("cooldowns") or []:
+                issues.append(format_cooldown_line(cd))
+            if issues:
+                alert_btn = Gtk.Button.new_from_icon_name("dialog-warning-symbolic", Gtk.IconSize.MENU)
+                alert_btn.set_relief(Gtk.ReliefStyle.NONE)
+                alert_btn.set_valign(Gtk.Align.CENTER)
+                alert_btn.get_style_context().add_class("qv-alert-btn")
+                alert_btn.set_tooltip_text("Click to inspect status / cooldown details")
+
+                def _show_issues(btn, lines=issues, title=f"{NAMES.get(a['provider'], a['provider'])} · {a['label']}"):
+                    pop = Gtk.Popover.new(btn)
+                    pop.set_position(Gtk.PositionType.BOTTOM)
+                    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                    box.set_property("margin", 10)
+                    hdr = Gtk.Label(label=title, xalign=0)
+                    hdr.get_style_context().add_class("qv-pop-title")
+                    box.pack_start(hdr, False, False, 0)
+                    for line in lines:
+                        lbl = Gtk.Label(label=line, xalign=0, wrap=True)
+                        lbl.set_max_width_chars(44)
+                        lbl.set_selectable(True)
+                        lbl.get_style_context().add_class("qv-pop-body")
+                        box.pack_start(lbl, False, False, 0)
+                    pop.add(box)
+                    self._open_popovers += 1
+                    pop.connect("closed", lambda *_: setattr(self, "_open_popovers", max(0, self._open_popovers - 1)))
+                    box.show_all()
+                    pop.popup()
+
+                alert_btn.connect("clicked", _show_issues)
+                head.pack_start(alert_btn, False, False, 0)
             g.attach(head, 1, 0, 2, 1)
             if a["plan"]:
-                plan = Gtk.Label(label=a["plan"].title(), xalign=1)
+                plan = Gtk.Label(label=format_plan(a["plan"]), xalign=1)
                 plan.get_style_context().add_class("qv-meta")
                 g.attach(plan, 3, 0, 1, 1)
             row = 1
-            if a["error"]:
-                e = Gtk.Label(label=a["error"], xalign=0, wrap=True)
-                e.get_style_context().add_class("qv-warn")
-                g.attach(e, 1, row, 3, 1)
-                row += 1
-            for cd in a.get("cooldowns") or []:
-                rel = when(cd.get("until"))[0]
-                cd_txt = f"Cooldown: {cd.get('model', 'account')}" + (f" ({rel})" if rel else "")
-                lbl = Gtk.Label(label=cd_txt, xalign=0, ellipsize=3)
-                lbl.get_style_context().add_class("qv-warn")
-                g.attach(lbl, 1, row, 3, 1)
-                row += 1
             for label, pct, reset, note in a["rows"]:
                 name = Gtk.Label(label=label, xalign=0, ellipsize=3)
                 name.get_style_context().add_class("qv-meta")
